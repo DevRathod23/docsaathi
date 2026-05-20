@@ -2,6 +2,7 @@
 
 import React, { useState } from "react";
 import { motion } from "framer-motion";
+import Script from "next/script";
 
 import {
   ShieldCheck,
@@ -17,6 +18,80 @@ import {
   Cpu,
   Sparkles,
 } from "lucide-react";
+
+// Helper to read image as Base64 Data URL
+const getBase64 = (file: File): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = (error) => reject(error);
+  });
+};
+
+// Helper to extract text from PDF client-side (with fallback to canvas rendering for scanned PDFs)
+const extractTextFromPdf = async (
+  file: File,
+  onScannedDetected?: () => void
+): Promise<string | string[]> => {
+  const pdfjsLib = (window as any).pdfjsLib;
+  if (!pdfjsLib) {
+    throw new Error("PDF parser library is still loading. Please try again in a moment!");
+  }
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js";
+  
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  let extractedText = "";
+  
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const textContent = await page.getTextContent();
+    const pageText = textContent.items
+      .map((item: any) => item.str)
+      .join(" ");
+    extractedText += pageText + "\n";
+  }
+  
+  // If no selectable text is found, it is a scanned document!
+  if (!extractedText.trim()) {
+    console.log("[PDF JS] No selectable text found. Converting pages to base64 images for AI OCR...");
+    if (onScannedDetected) {
+      onScannedDetected();
+    }
+    
+    const imageUrls: string[] = [];
+    // Limit to maximum 8 pages of scanned PDF to avoid massive payload sizes
+    const maxPages = Math.min(pdf.numPages, 8);
+    
+    for (let i = 1; i <= maxPages; i++) {
+      const page = await pdf.getPage(i);
+      const viewport = page.getViewport({ scale: 1.5 }); // Optimal scale for OCR readability
+      const canvas = document.createElement("canvas");
+      const context = canvas.getContext("2d");
+      
+      if (!context) {
+        throw new Error("Failed to initialize canvas context for PDF page rendering.");
+      }
+      
+      canvas.height = viewport.height;
+      canvas.width = viewport.width;
+      
+      await page.render({
+        canvasContext: context,
+        viewport: viewport
+      }).promise;
+      
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.85); // High quality JPEG
+      imageUrls.push(dataUrl);
+    }
+    
+    return imageUrls;
+  }
+  
+  return extractedText;
+};
+
 const SectionDivider = ({
   glowColor = "rgba(59,130,246,0.5)",
 }) => (
@@ -75,49 +150,90 @@ KEY DETAILS:
   const [showExample, setShowExample] = useState(false);
 
   const handleAnalyze = async () => {
-    let contentToAnalyze = "";
-
-    if (activeTab === "paste") {
-      if (!text.trim()) {
-        alert("Please paste some text first!");
-        return;
-      }
-
-      contentToAnalyze = text;
-    }
-
-    if (activeTab === "upload") {
-      if (!pdfFile) {
-        alert("Please select a PDF file!");
-        return;
-      }
-
-      contentToAnalyze = pdfFile.name;
-    }
-
-    if (activeTab === "ocr") {
-      if (!imageFile) {
-        alert("Please select an image!");
-        return;
-      }
-
-      contentToAnalyze = imageFile.name;
-    }
+    let contentToAnalyze: string | string[] = "";
 
     setIsAnalyzing(true);
-
     setSummary(`
 SUMMARY:
-- AI is analyzing your document...
+- AI is preparing your document...
 
 IMPORTANT POINTS:
 - Please wait a few seconds.
 
 KEY DETAILS:
-- Extracting important information.
+- Processing file and extracting text.
 `);
 
     try {
+      if (activeTab === "paste") {
+        if (!text.trim()) {
+          alert("Please paste some text first!");
+          setIsAnalyzing(false);
+          return;
+        }
+        contentToAnalyze = text;
+      }
+
+      if (activeTab === "upload") {
+        if (!pdfFile) {
+          alert("Please select a PDF file!");
+          setIsAnalyzing(false);
+          return;
+        }
+        setSummary(`
+SUMMARY:
+- Extracting text from PDF...
+
+IMPORTANT POINTS:
+- Reading document structures and content in your browser.
+
+KEY DETAILS:
+- Analyzing pages.
+`);
+        contentToAnalyze = await extractTextFromPdf(pdfFile, () => {
+          setSummary(`
+SUMMARY:
+- Scanned PDF detected!
+
+IMPORTANT POINTS:
+- Converting document pages to high-resolution images for AI OCR in your browser...
+
+KEY DETAILS:
+- Running server-side OCR on the converted pages.
+`);
+        });
+      }
+
+      if (activeTab === "ocr") {
+        if (!imageFile) {
+          alert("Please select an image!");
+          setIsAnalyzing(false);
+          return;
+        }
+        setSummary(`
+SUMMARY:
+- Reading image contents...
+
+IMPORTANT POINTS:
+- Processing base64 image data for advanced Llama 3.2 Vision OCR.
+
+KEY DETAILS:
+- Preparing visual token analysis.
+`);
+        contentToAnalyze = await getBase64(imageFile);
+      }
+
+      setSummary(`
+SUMMARY:
+- AI is analyzing your document contents...
+
+IMPORTANT POINTS:
+- Auto-detecting document category (Medical/Legal).
+
+KEY DETAILS:
+- Generating response using Groq.
+`);
+
       const response = await fetch("/api/analyze", {
         method: "POST",
 
@@ -131,7 +247,13 @@ KEY DETAILS:
         }),
       });
 
-      const data = await response.json();
+      const contentType = response.headers.get("content-type");
+      let data;
+      if (contentType && contentType.includes("application/json")) {
+        data = await response.json();
+      } else {
+        throw new Error("Server returned an unexpected non-JSON response. Please try again.");
+      }
 
       console.log("API RESULT:", data);
 
@@ -160,18 +282,18 @@ KEY DETAILS:
 - Please check backend.
 `);
       }
-    } catch (error) {
-      console.error(error);
+    } catch (error: any) {
+      console.error("Analysis Error:", error);
 
       setSummary(`
 SUMMARY:
-- Connection failed.
+- Connection failed or extraction failed.
 
 IMPORTANT POINTS:
-- Could not connect to AI service.
+- ${error.message || "Could not complete text analysis."}
 
 KEY DETAILS:
-- Check API key and internet connection.
+- Check API configuration or file format.
 `);
     } finally {
       setIsAnalyzing(false);
@@ -453,6 +575,10 @@ KEY DETAILS:
                 </div>
 
                 <div className="p-8">
+                  <Script 
+                    src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js" 
+                    strategy="lazyOnload" 
+                  />
 
                   {/* PASTE */}
 
@@ -637,21 +763,35 @@ KEY DETAILS:
             const items = lines.slice(1);
 
             const getIcon = () => {
-              if (title.includes("SUMMARY")) return "🧠";
-              if (title.includes("IMPORTANT")) return "⚠️";
-              if (title.includes("KEY")) return "📌";
+              const uppercaseTitle = title.toUpperCase();
+              if (uppercaseTitle.includes("NOTICE") || uppercaseTitle.includes("⚠️")) return "⚠️";
+              if (uppercaseTitle.includes("INSIGHT") || uppercaseTitle.includes("KEY")) return "📌";
+              if (uppercaseTitle.includes("RISK") || uppercaseTitle.includes("IMPORTANT")) return "⚠️";
+              if (uppercaseTitle.includes("FINDING") || uppercaseTitle.includes("CRITICAL")) return "🔬";
+              if (uppercaseTitle.includes("ACTION") || uppercaseTitle.includes("RECOMMENDED")) return "⚡";
+              if (uppercaseTitle.includes("EXPLANATION") || uppercaseTitle.includes("SIMPLIFIED")) return "🧠";
               return "✨";
             };
 
             const getBorder = () => {
-              if (title.includes("SUMMARY"))
+              const uppercaseTitle = title.toUpperCase();
+              if (uppercaseTitle.includes("NOTICE") || uppercaseTitle.includes("⚠️"))
+                return "border-red-500 bg-red-500/10 text-red-200 animate-pulse";
+
+              if (uppercaseTitle.includes("INSIGHT") || uppercaseTitle.includes("KEY"))
+                return "border-emerald-500/20 bg-emerald-500/5";
+
+              if (uppercaseTitle.includes("RISK") || uppercaseTitle.includes("IMPORTANT"))
+                return "border-red-500/20 bg-red-500/5";
+
+              if (uppercaseTitle.includes("FINDING") || uppercaseTitle.includes("CRITICAL"))
                 return "border-cyan-500/20 bg-cyan-500/5";
 
-              if (title.includes("IMPORTANT"))
-                return "border-yellow-500/20 bg-yellow-500/5";
+              if (uppercaseTitle.includes("ACTION") || uppercaseTitle.includes("RECOMMENDED"))
+                return "border-amber-500/20 bg-amber-500/5";
 
-              if (title.includes("KEY"))
-                return "border-green-500/20 bg-green-500/5";
+              if (uppercaseTitle.includes("EXPLANATION") || uppercaseTitle.includes("SIMPLIFIED"))
+                return "border-indigo-500/20 bg-indigo-500/5";
 
               return "border-primary/20 bg-primary/5";
             };
@@ -678,7 +818,7 @@ KEY DETAILS:
                   </div>
 
                   <h3 className="text-xl font-bold text-white tracking-wide">
-                    {title.replace(/[:]/g, "")}
+                    {title.replace(/^[#\s]+|[:]/g, "")}
                   </h3>
 
                 </div>
